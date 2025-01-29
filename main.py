@@ -17,21 +17,23 @@ from telegram.ext import (
     CallbackContext
 )
 
-# -------------------
-# ЧИТАЄМО ТОКЕН ІЗ ЗМІННОЇ ОТОЧЕННЯ
-# -------------------
+# =========================
+# НАЛАШТУВАННЯ ТА ГЛОБАЛЬНІ ЗМІННІ
+# =========================
+
+# Читаємо токен із змінної оточення (Railway, Heroku та ін.):
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("❌ ПОМИЛКА: Змінна середовища `TOKEN` не задана або порожня!")
 
-print(f"✅ Отриманий токен: {TOKEN[:10]}... (далі приховано)")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# -------------------
-# ЗМІННІ ТА СТАНИ
-# -------------------
-tasks_data = {}  # { user_id: [ {id, type, datetime, city, phone, price, status, completed_date}, ... ], ... }
+# Зберігаємо завдання в пам'яті (для справжньої реалізації краще підключити БД)
+tasks_data = {}  # {user_id: [ {id, type, datetime, city, phone, price, status, completed_date}, ... ]}
 global_task_id_counter = 1
 
+# СТАНИ (для ConversationHandler - «Додати завдання»)
 (
     CHOOSING_TYPE,
     CHOOSING_DATE,
@@ -41,9 +43,7 @@ global_task_id_counter = 1
     INPUT_PRICE
 ) = range(6)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# ГОЛОВНЕ МЕНЮ
 MAIN_MENU_KEYBOARD = [
     ["Додати завдання"],
     ["Перегляд завдань"],
@@ -58,57 +58,53 @@ def get_main_menu():
         resize_keyboard=True
     )
 
-
 # -------------------
 # ХЕЛПЕРИ
 # -------------------
 def init_user_data_if_needed(user_id: int):
-    """Ініціалізувати масив завдань, якщо ще не існує."""
+    """Ініціалізувати список завдань, якщо ще не існує."""
     if user_id not in tasks_data:
         tasks_data[user_id] = []
 
-
 def validate_phone(phone_text: str) -> bool:
+    """Перевірка коректності телефону."""
     import re
     pattern = r'^(\+?\d{9,13})$'
     return bool(re.match(pattern, phone_text))
 
-
 def parse_date_as_date(date_text: str) -> datetime.date:
     """
-    Парсить дату з тексту у datetime.date.
-    Повертає:
-      - date.today() + 1 день, якщо 'завтра'
-      - date.today() + 2 дні, якщо 'післязавтра'
-      - або намагається розпарсити формати, як-от '15.01', '15-01', '15 01', '1501'.
-    Якщо не вдасться, повертає date.today().
+    Парсить дату у формат datetime.date.
+    - 'завтра' → today + 1 день
+    - 'післязавтра' → today + 2 дні
+    - спроба прочитати з 15.01, 15-01, 1501 тощо
+    Якщо не вдається, повертає сьогодні.
     """
     today = datetime.date.today()
-    txt_lower = date_text.lower().strip()
+    txt = date_text.lower().strip()
 
-    if "завтра" in txt_lower:
+    if "завтра" in txt:
         return today + datetime.timedelta(days=1)
-    if "післязавтра" in txt_lower:
+    if "післязавтра" in txt:
         return today + datetime.timedelta(days=2)
 
     import re
-    only_digits = "".join(re.findall(r'\d+', txt_lower))
+    only_digits = "".join(re.findall(r'\d+', txt))
     if len(only_digits) == 4:
         day = int(only_digits[:2])
         month = int(only_digits[2:])
-        year = today.year  # або додати логіку вибору року
+        year = today.year
         try:
             return datetime.date(year, month, day)
         except ValueError:
             return today
     return today
 
-
 def parse_time_as_hours_minutes(time_text: str) -> (int, int):
     """
-    Парсить час і повертає (години, хвилини).
-    Приклади: '12:00', '12.00', '1200', '12 00', '12'.
-    Якщо не вдається – повертає (9, 0) за замовчуванням.
+    Парсить час і повертає (година, хвилина).
+    Наприклад, "12:00", "1200", "12.00", "12" тощо.
+    Якщо не виходить — повертає (9, 0) за замовчуванням (9:00).
     """
     import re
     txt = time_text.strip().lower()
@@ -136,11 +132,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# -------------------
-# ДОДАТИ ЗАВДАННЯ (ConversationHandler)
-# -------------------
+# =========================
+# 1) ДОДАТИ ЗАВДАННЯ (ConversationHandler)
+# =========================
+
+# --- КРОК 1: ВИБІР ТИПУ ---
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """КРОК 1: Вибір типу."""
     await update.message.reply_text(
         "Оберіть тип завдання або введіть свій варіант:",
         reply_markup=ReplyKeyboardMarkup(
@@ -156,19 +153,20 @@ async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     return CHOOSING_TYPE
 
-
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip().lower()
     if text == "на початок":
         await start_command(update, context)
         return ConversationHandler.END
 
+    # Зберігаємо вибраний тип
     context.user_data["new_task"] = {
         "type": update.message.text.strip()
     }
 
+    # Переходимо до КРОКУ 2
     await update.message.reply_text(
-        "Оберіть дату (завтра / післязавтра) або введіть вручну (15.01, 15-01, 15 01 тощо):",
+        "Оберіть дату (завтра / післязавтра) або введіть вручну (15.01, 15-01 тощо):",
         reply_markup=ReplyKeyboardMarkup(
             [
                 ["Завтра"],
@@ -181,7 +179,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     return CHOOSING_DATE
 
-
+# --- КРОК 2: ВИБІР ДАТИ ---
 async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip().lower()
     if text == "на початок":
@@ -191,7 +189,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     chosen_date = parse_date_as_date(update.message.text)
     context.user_data["temp_date"] = chosen_date
 
-    # Переходимо до кроку 3 - вибір часу
+    # Переходимо до КРОКУ 3
     time_buttons = []
     for hour in range(9, 19):
         time_buttons.append([f"{hour}:00"])
@@ -203,7 +201,7 @@ async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     return CHOOSING_TIME
 
-
+# --- КРОК 3: ВИБІР ЧАСУ ---
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip().lower()
     if text == "на початок":
@@ -216,14 +214,14 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     context.user_data["new_task"]["datetime"] = task_dt
 
-    # КРОК 4: введення населеного пункту
+    # КРОК 4: населений пункт
     await update.message.reply_text(
         "Введіть назву населеного пункту (необов’язково). "
-        "Якщо пропустити, просто натисніть Enter або кнопку 'На початок':"
+        "Якщо пропустити — просто натисніть Enter або кнопку 'На початок'."
     )
     return INPUT_CITY
 
-
+# --- КРОК 4: ВВЕДЕННЯ МІСТА ---
 async def input_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     if text.lower() == "на початок":
@@ -232,13 +230,13 @@ async def input_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["new_task"]["city"] = text if text else ""
 
-    # КРОК 5: введення телефону
+    # КРОК 5: телефон
     await update.message.reply_text(
-        "Введіть номер телефону замовника у форматах: +380123456789, 380123456789, 0123456789 або 123456789:"
+        "Введіть номер телефону замовника ( +380..., 380..., 0123..., 1234... ):"
     )
     return INPUT_PHONE
 
-
+# --- КРОК 5: ВВЕДЕННЯ ТЕЛЕФОНУ ---
 async def input_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone_text = update.message.text.strip().lower()
     if phone_text == "на початок":
@@ -256,12 +254,12 @@ async def input_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     # КРОК 6: вартість
     keyboard = [["Не вказувати"], ["На початок"]]
     await update.message.reply_text(
-        "Введіть вартість роботи (1 - 1000000 грн). Або натисніть 'Не вказувати':",
+        "Введіть вартість (1 - 1000000 грн) або натисніть 'Не вказувати':",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
     return INPUT_PRICE
 
-
+# --- КРОК 6: ВВЕДЕННЯ ВАРТОСТІ ---
 async def input_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     global global_task_id_counter
     user_id = update.effective_user.id
@@ -296,7 +294,6 @@ async def input_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     global_task_id_counter += 1
     init_user_data_if_needed(user_id)
-
     tasks_data[user_id].append(context.user_data["new_task"])
 
     # Прибираємо тимчасові дані
@@ -311,9 +308,9 @@ async def input_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return ConversationHandler.END
 
 
-# -------------------
-# ПЕРЕГЛЯД ЗАВДАНЬ
-# -------------------
+# =========================
+# 2) ПЕРЕГЛЯД ЗАВДАНЬ
+# =========================
 async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user_data_if_needed(user_id)
@@ -326,7 +323,7 @@ async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Сортуємо за datetime
+    # Відсортуємо за датою/часом
     uncompleted.sort(key=lambda x: x["datetime"])
 
     lines = ["<b>Список невиконаних завдань:</b>"]
@@ -352,17 +349,22 @@ async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# -------------------
-# ВИДАЛИТИ ЗАВДАННЯ
-# -------------------
+# =========================
+# 3) ВИДАЛИТИ ЗАВДАННЯ
+# =========================
 async def delete_task_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запитуємо номер завдання для видалення.
+    """
     await update.message.reply_text(
         "Вкажіть номер завдання (у списку вище), яке бажаєте видалити.\n"
-        "Або 'На початок' для відміни."
+        "Або 'На початок' для виходу."
     )
 
-
 async def delete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Видаляємо завдання з невиконаних.
+    """
     user_id = update.effective_user.id
     init_user_data_if_needed(user_id)
 
@@ -389,17 +391,22 @@ async def delete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Будь ласка, введіть ціле число.")
 
 
-# -------------------
-# ПОЗНАЧИТИ ЯК ВИКОНАНЕ
-# -------------------
+# =========================
+# 4) ПОЗНАЧИТИ ЗАВДАННЯ ВИКОНАНИМ
+# =========================
 async def complete_task_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запитуємо номер завдання для позначення виконаним.
+    """
     await update.message.reply_text(
         "Вкажіть номер завдання (у списку вище), яке бажаєте позначити виконаним.\n"
-        "Або 'На початок' для відміни."
+        "Або 'На початок' для виходу."
     )
 
-
 async def complete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Змінюємо статус завдання на 'completed' і ставимо дату виконання.
+    """
     user_id = update.effective_user.id
     init_user_data_if_needed(user_id)
 
@@ -417,6 +424,7 @@ async def complete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             to_complete = uncompleted[idx]
             to_complete["status"] = "completed"
             to_complete["completed_date"] = datetime.datetime.now()
+
             await update.message.reply_text(
                 f"Завдання [ID:{to_complete['id']}] позначене виконаним.",
                 reply_markup=get_main_menu()
@@ -427,9 +435,9 @@ async def complete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Будь ласка, введіть ціле число.")
 
 
-# -------------------
-# ВИКОНАНІ ЗАВДАННЯ
-# -------------------
+# =========================
+# 5) ВИКОНАНІ ЗАВДАННЯ
+# =========================
 async def view_completed_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user_data_if_needed(user_id)
@@ -459,9 +467,9 @@ async def view_completed_tasks(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# -------------------
-# СУМА ЗА ОСТАННІ 30 ДНІВ
-# -------------------
+# =========================
+# 6) СУМА ЗА ОСТАННІ 30 ДНІВ
+# =========================
 async def sum_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user_data_if_needed(user_id)
@@ -483,9 +491,9 @@ async def sum_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# -------------------
-# ЩОДЕННЕ НАГАДУВАННЯ
-# -------------------
+# =========================
+# 7) ЩОДЕННЕ НАГАДУВАННЯ (опціонально)
+# =========================
 async def daily_reminder(context: CallbackContext):
     now = datetime.datetime.now()
     today = now.date()
@@ -515,9 +523,9 @@ async def daily_reminder(context: CallbackContext):
             )
 
 
-# -------------------
-# FALLBACK
-# -------------------
+# =========================
+# FALLBACK / НЕВІДПОВІДНІ ПОВІДОМЛЕННЯ
+# =========================
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     if text == "на початок":
@@ -528,22 +536,24 @@ async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# -------------------
+# =========================
 # MAIN
-# -------------------
+# =========================
 def main():
-    # Persistence для зберігання стану між рестартами
+    # Збереження стану між рестартами
     persistence = PicklePersistence(filepath="bot_data.pkl")
 
+    # Створюємо Application
     app = Application.builder().token(TOKEN).persistence(persistence).build()
 
-    # Щоденне нагадування о 6:00
-    app.job_queue.run_daily(
-        daily_reminder,
-        time=datetime.time(hour=6, minute=0, second=0)
-    )
+    # (Опційно) Щоденне нагадування о 6:00
+    # Встановіть "python-telegram-bot[job-queue]" у requirements.txt
+    app.job_queue.run_daily(daily_reminder, time=datetime.time(hour=6, minute=0, second=0))
 
-    # ConversationHandler для "Додати завдання"
+    # --- 1) Обробник команди /start
+    app.add_handler(CommandHandler("start", start_command))
+
+    # --- 2) Додати завдання (ConversationHandler)
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Додати завдання$"), add_task_start)],
         states={
@@ -558,42 +568,42 @@ def main():
             MessageHandler(filters.Regex("^На початок$"), start_command)
         ]
     )
-
-    # /start
-    app.add_handler(CommandHandler("start", start_command))
-    # Додати завдання
     app.add_handler(conv_handler)
 
-    # Перегляд завдань
+    # --- 3) Перегляд завдань
     app.add_handler(MessageHandler(filters.Regex("^Перегляд завдань$"), view_tasks))
 
-    # Видалити завдання
+    # --- 4) Видалення завдань
+    #   4.1) Натиснули "Видалити завдання"
     app.add_handler(MessageHandler(filters.Regex("^Видалити завдання$"), delete_task_request))
+    #   4.2) Підтвердження видалення (введення номера)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(Перегляд завдань|Виконані завдання|Сума за останній місяць)$"),
         delete_task_confirm
     ), 1)
 
-    # Позначити виконаним
+    # --- 5) Позначити виконаним
+    #   5.1) Натиснули "Позначити завдання виконаним"
     app.add_handler(MessageHandler(filters.Regex("^Позначити завдання виконаним$"), complete_task_request))
+    #   5.2) Підтвердження (введення номера)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(Перегляд завдань|Виконані завдання|Сума за останній місяць)$"),
         complete_task_confirm
     ), 2)
 
-    # Виконані завдання
+    # --- 6) Виконані завдання
     app.add_handler(MessageHandler(filters.Regex("^Виконані завдання$"), view_completed_tasks))
 
-    # Сума за останній місяць
+    # --- 7) Сума за останній місяць
     app.add_handler(MessageHandler(filters.Regex("^Сума за останній місяць$"), sum_last_month))
 
-    # На початок
+    # --- 8) На початок
     app.add_handler(MessageHandler(filters.Regex("^На початок$"), start_command))
 
-    # Fallback (для інших текстових повідомлень)
+    # --- 9) Fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
 
-    # Запускаємо бота
+    # Запуск бота
     app.run_polling()
 
 
