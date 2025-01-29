@@ -1,102 +1,598 @@
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import re
-from datetime import datetime, timedelta
-import calendar
-import os
+import logging
+import datetime
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    CallbackContext,
+    ContextTypes,
+    PicklePersistence
+)
 
-# Список завдань
-tasks = []
-completed_tasks = []
+# -------------------
+# ЗМІННІ ТА СТАНИ
+# -------------------
+tasks_data = {}  # { user_id: [ {id, type, datetime, city, phone, price, status, completed_date}, ... ], ... }
+global_task_id_counter = 1
 
-def parse_date_and_time(text):
-    """Парсинг дати і часу із тексту з підтримкою різних форматів."""
-    now = datetime.now()
-    date = ""
-    time = ""
+(
+    CHOOSING_TYPE,
+    CHOOSING_DATE,
+    CHOOSING_TIME,
+    INPUT_CITY,
+    INPUT_PHONE,
+    INPUT_PRICE
+) = range(6)
 
-    # Пошук дати в різних форматах
-    date_match = re.search(r"\b(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}|\d{2}/\d{2}/\d{4})\b", text)
-    if date_match:
-        date = date_match.group(1)
-    else:
-        day_names = {
-            "сьогодні": 0, "завтра": 1, "понеділок": 0, "вівторок": 1, "середа": 2, "четвер": 3, "п'ятниця": 4, "субота": 5, "неділя": 6
-        }
-        for day_name, offset in day_names.items():
-            if day_name in text.lower():
-                if day_name in ["сьогодні", "завтра"]:
-                    date = (now + timedelta(days=offset)).strftime("%Y-%m-%d")
-                else:
-                    current_weekday = now.weekday()
-                    target_weekday = offset
-                    days_ahead = (target_weekday - current_weekday + 7) % 7
-                    if days_ahead == 0:
-                        days_ahead = 7
-                    date = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-                break
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    # Пошук часу в різних форматах
-    time_match = re.search(r"\b(\d{1,2}:\d{2}|\d{1,2}\.\d{2}|\d{1,2}\s?(AM|PM|am|pm))\b", text)
-    if time_match:
-        time = time_match.group(1).replace('.', ':').upper()
-        # Конвертація часу формату 12 годин (AM/PM) у 24 години
-        if "AM" in time or "PM" in time:
-            time = datetime.strptime(time, "%I:%M %p").strftime("%H:%M")
+MAIN_MENU_KEYBOARD = [
+    ["Додати завдання"],
+    ["Перегляд завдань"],
+    ["Виконані завдання"],
+    ["Сума за останній місяць"],
+    ["На початок"]
+]
 
-    return date, time
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Привітання та інструкція."""
-    keyboard = [["Додати завдання", "Список завдань", "Позначити виконаним", "Виконані завдання"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(
-        "Привіт! Я бот для управління завданнями. Вибери дію за допомогою кнопок нижче або просто введіть текст завдання у довільному форматі.",
-        reply_markup=reply_markup
+def get_main_menu():
+    return ReplyKeyboardMarkup(
+        MAIN_MENU_KEYBOARD,
+        resize_keyboard=True
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка повідомлень від користувача."""
-    text = update.message.text
 
-    if text == "Додати завдання":
-        await update.message.reply_text("Введіть завдання у форматі: \nТип завдання, дата, час, місце, вартість (наприклад: 'Топозйомка завтра 14:00 вул. Лісова 10 500')")
+# -------------------
+# ХЕЛПЕРИ
+# -------------------
+def init_user_data_if_needed(user_id: int):
+    """Ініціалізувати масив завдань, якщо ще не існує."""
+    if user_id not in tasks_data:
+        tasks_data[user_id] = []
 
-    elif text == "Список завдань":
-        if not tasks:
-            await update.message.reply_text("Список завдань порожній!")
-        else:
-            reply = "\n".join([
-                f"{i + 1}. {task['type']}\nМісце: {task['place']}\nДата: {task['date']}\nЧас: {task['time']}\nВартість: {task['cost']} грн"
-                for i, task in enumerate(tasks)
-            ])
-            await update.message.reply_text(f"Ось список завдань:\n{reply}")
 
+def validate_phone(phone_text: str) -> bool:
+    import re
+    pattern = r'^(\+?\d{9,13})$'
+    return bool(re.match(pattern, phone_text))
+
+
+def parse_date_as_date(date_text: str) -> datetime.date:
+    """
+    Парсить дату з тексту у datetime.date.
+    Повертає:
+      - date.today() + 1 день, якщо 'завтра'
+      - date.today() + 2 дні, якщо 'післязавтра'
+      - або намагається розпарсити формати, як-от '15.01', '15-01', '15 01'
+    Якщо не вдасться, повертає date.today() (можна зробити інакше).
+    """
+    today = datetime.date.today()
+    date_text = date_text.lower().strip()
+
+    if "завтра" in date_text:
+        return today + datetime.timedelta(days=1)
+    if "післязавтра" in date_text:
+        return today + datetime.timedelta(days=2)
+
+    # Спробуємо пошукати розділення дня/місяця у форматі 15.01, 15-01, 15 01, 1501
+    import re
+    only_digits = "".join(re.findall(r'\d+', date_text))
+    # Якщо 4 цифри – припустимо, що це день і місяць поточного року
+    if len(only_digits) == 4:
+        day = int(only_digits[:2])
+        month = int(only_digits[2:])
+        year = today.year  # можна розширити логіку на інший рік
+        try:
+            return datetime.date(year, month, day)
+        except ValueError:
+            # Якщо некоректна дата (наприклад, 31.02) – повернемо сьогодні
+            return today
+    # Якщо не вдалось, повернемо сьогодні або можна кинути помилку
+    return today
+
+
+def parse_time_as_hours_minutes(time_text: str) -> (int, int):
+    """
+    Парсить час і повертає (години, хвилини).
+    Приклади: '12:00', '12.00', '1200', '12 00', '12'.
+    Якщо не вдається – повертає (9, 0) за замовчуванням (9:00).
+    """
+    import re
+    time_text = time_text.strip().lower()
+    only_digits = "".join(re.findall(r'\d+', time_text))
+
+    if len(only_digits) == 4:
+        # Приклад: "1200" -> (12, 00)
+        h = int(only_digits[:2])
+        m = int(only_digits[2:])
+        return (h, m)
+    elif len(only_digits) == 2:
+        # Приклад: "12" -> (12, 0)
+        return (int(only_digits), 0)
+    return (9, 0)  # дефолтний час 9:00 (якщо не вдалося)
+
+
+# -------------------
+# /start
+# -------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
+
+    await update.message.reply_text(
+        "Ласкаво просимо! Оберіть дію:",
+        reply_markup=get_main_menu()
+    )
+
+
+# -------------------
+# ДОДАТИ ЗАВДАННЯ
+# -------------------
+async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """КРОК 1: Вибір типу."""
+    await update.message.reply_text(
+        "Оберіть тип завдання або введіть свій варіант:",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["Винос"],
+                ["Топозйомка"],
+                ["Приватизація"],
+                ["На початок"]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    return CHOOSING_TYPE
+
+
+async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    context.user_data["new_task"] = {
+        "type": update.message.text.strip()
+    }
+    await update.message.reply_text(
+        "Оберіть дату (завтра / післязавтра) або введіть вручну (15.01, 15-01, 15 01 тощо):",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["Завтра"],
+                ["Післязавтра"],
+                ["На початок"]
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    return CHOOSING_DATE
+
+
+async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    # Парсимо дату
+    chosen_date = parse_date_as_date(update.message.text)
+    # Тимчасово збережемо "date" (без часу)
+    context.user_data["temp_date"] = chosen_date
+
+    # Переходимо до кроку 3 - вибір часу
+    # Зробимо кнопки з 9:00 до 18:00
+    time_buttons = []
+    for hour in range(9, 19):
+        time_buttons.append([f"{hour}:00"])
+    time_buttons.append(["На початок"])
+
+    await update.message.reply_text(
+        "Оберіть час (9:00 - 18:00) або введіть вручну (12:00, 12.00, 12 00, 12):",
+        reply_markup=ReplyKeyboardMarkup(time_buttons, resize_keyboard=True, one_time_keyboard=True)
+    )
+    return CHOOSING_TIME
+
+
+async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    # Парсимо час
+    h, m = parse_time_as_hours_minutes(update.message.text)
+    base_date = context.user_data.get("temp_date", datetime.date.today())
+    # Формуємо datetime (припустимо, що секунди = 0)
+    task_dt = datetime.datetime(
+        year=base_date.year,
+        month=base_date.month,
+        day=base_date.day,
+        hour=h,
+        minute=m
+    )
+
+    context.user_data["new_task"]["datetime"] = task_dt
+
+    # КРОК 4: введення населеного пункту
+    await update.message.reply_text(
+        "Введіть назву населеного пункту (необов’язково). Якщо пропустити, просто натисніть Enter або кнопку 'На початок':"
+    )
+    return INPUT_CITY
+
+
+async def input_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text.lower() == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    context.user_data["new_task"]["city"] = text if text else ""
+
+    # КРОК 5: введення телефону
+    await update.message.reply_text(
+        "Введіть номер телефону замовника у форматах: +380123456789, 380123456789, 0123456789 або 123456789:"
+    )
+    return INPUT_PHONE
+
+
+async def input_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    phone_text = update.message.text.strip().lower()
+    if phone_text == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    if not validate_phone(phone_text):
+        await update.message.reply_text(
+            "Невірний формат телефону. Спробуйте ще раз або 'На початок' для відміни."
+        )
+        return INPUT_PHONE
+
+    context.user_data["new_task"]["phone"] = phone_text
+    # КРОК 6: вартість
+    keyboard = [["Не вказувати"], ["На початок"]]
+    await update.message.reply_text(
+        "Введіть вартість роботи (1 - 1000000 грн). Або натисніть 'Не вказувати':",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    )
+    return INPUT_PRICE
+
+
+async def input_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    global global_task_id_counter
+    user_id = update.effective_user.id
+
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    if text == "не вказувати" or text == "":
+        price_value = "Не вказано"
     else:
-        # Автоматичне зчитування завдання з тексту
-        parts = text.split()
-        if len(parts) >= 4:
-            task_type, date_str, time_str, *location_cost = parts
-            date, time = parse_date_and_time(date_str + " " + time_str)
-            try:
-                cost = float(location_cost[-1])
-                place = " ".join(location_cost[:-1])
-                new_task = {'type': task_type, 'date': date, 'time': time, 'place': place, 'cost': cost}
-                tasks.append(new_task)
-                await update.message.reply_text(f"✅ Завдання додано: {task_type}, {date}, {time}, {place}, {cost} грн")
-            except ValueError:
-                await update.message.reply_text("Помилка у форматі вартості. Введіть число.")
+        try:
+            val = int(text)
+            if 1 <= val <= 1_000_000:
+                price_value = val
+            else:
+                await update.message.reply_text("Невірне число. Спробуйте ще раз або 'На початок' для скасування.")
+                return INPUT_PRICE
+        except ValueError:
+            await update.message.reply_text("Не вдалося розпізнати число. Спробуйте ще раз або 'На початок'.")
+            return INPUT_PRICE
+
+    # Записуємо у new_task
+    context.user_data["new_task"]["price"] = price_value
+    context.user_data["new_task"]["status"] = "uncompleted"
+    context.user_data["new_task"]["completed_date"] = None
+    context.user_data["new_task"]["id"] = global_task_id_counter
+
+    global_task_id_counter += 1
+    init_user_data_if_needed(user_id)
+
+    # Зберігаємо
+    tasks_data[user_id].append(context.user_data["new_task"])
+
+    # Прибираємо тимчасові дані
+    del context.user_data["new_task"]
+    if "temp_date" in context.user_data:
+        del context.user_data["temp_date"]
+
+    await update.message.reply_text("Завдання успішно додано!", reply_markup=get_main_menu())
+    return ConversationHandler.END
+
+
+# -------------------
+# ПЕРЕГЛЯД ЗАВДАНЬ
+# -------------------
+async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
+
+    uncompleted = [t for t in tasks_data[user_id] if t["status"] == "uncompleted"]
+    if not uncompleted:
+        await update.message.reply_text("Наразі немає невиконаних завдань.", reply_markup=get_main_menu())
+        return
+
+    # Сортуємо за datetime (від найранішого до пізнішого)
+    uncompleted.sort(key=lambda x: x["datetime"])
+
+    lines = ["<b>Список невиконаних завдань:</b>"]
+    for idx, task in enumerate(uncompleted, start=1):
+        dt_str = task["datetime"].strftime("%d.%m %H:%M")
+        price_str = task["price"]
+        lines.append(
+            f"{idx}. [ID:{task['id']}] Тип: {task['type']}\n"
+            f"   Дата/час: {dt_str}\n"
+            f"   Місто: {task['city']} | Телефон: {task['phone']} | Ціна: {price_str}"
+        )
+
+    lines.append("\nЩо бажаєте зробити?")
+    keyboard = [
+        ["Видалити завдання"],
+        ["Позначити завдання виконаним"],
+        ["На початок"]
+    ]
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+
+# -------------------
+# ВИДАЛИТИ ЗАВДАННЯ
+# -------------------
+async def delete_task_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Вкажіть номер завдання (у списку вище), яке бажаєте видалити.\n"
+        "Або 'На початок' для відміни."
+    )
+
+
+async def delete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
+
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return
+
+    uncompleted = [t for t in tasks_data[user_id] if t["status"] == "uncompleted"]
+    # Сортування має бути таким самим, як і при відображенні
+    uncompleted.sort(key=lambda x: x["datetime"])
+
+    try:
+        idx = int(text) - 1
+        if 0 <= idx < len(uncompleted):
+            to_del = uncompleted[idx]
+            tasks_data[user_id].remove(to_del)
+            await update.message.reply_text(
+                f"Завдання [ID:{to_del['id']}] видалено.",
+                reply_markup=get_main_menu()
+            )
         else:
-            await update.message.reply_text("❌ Невірний формат. Використовуйте: 'Тип завдання день час місце вартість'")
+            await update.message.reply_text("Невірний номер. Спробуйте ще раз.")
+    except ValueError:
+        await update.message.reply_text("Будь ласка, введіть ціле число.")
 
-from telegram.ext import ApplicationBuilder
 
-TOKEN = os.getenv("TOKEN")  # Railway передає токен як змінну середовища
+# -------------------
+# ПОЗНАЧИТИ ЯК ВИКОНАНЕ
+# -------------------
+async def complete_task_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Вкажіть номер завдання (у списку вище), яке бажаєте позначити виконаним.\n"
+        "Або 'На початок' для відміни."
+    )
 
-app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+async def complete_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
 
-print("Бот запущено!")
-app.run_polling()
+    text = update.message.text.strip().lower()
+    if text == "на початок":
+        await start_command(update, context)
+        return
+
+    uncompleted = [t for t in tasks_data[user_id] if t["status"] == "uncompleted"]
+    uncompleted.sort(key=lambda x: x["datetime"])
+
+    try:
+        idx = int(text) - 1
+        if 0 <= idx < len(uncompleted):
+            to_complete = uncompleted[idx]
+            to_complete["status"] = "completed"
+            to_complete["completed_date"] = datetime.datetime.now()
+            await update.message.reply_text(
+                f"Завдання [ID:{to_complete['id']}] позначене виконаним.",
+                reply_markup=get_main_menu()
+            )
+        else:
+            await update.message.reply_text("Невірний номер. Спробуйте ще раз.")
+    except ValueError:
+        await update.message.reply_text("Будь ласка, введіть ціле число.")
+
+
+# -------------------
+# ВИКОНАНІ ЗАВДАННЯ
+# -------------------
+async def view_completed_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
+
+    completed = [t for t in tasks_data[user_id] if t["status"] == "completed"]
+    if not completed:
+        await update.message.reply_text("Немає виконаних завдань.", reply_markup=get_main_menu())
+        return
+
+    # Сортуємо за датою виконання
+    completed.sort(key=lambda x: x["completed_date"], reverse=True)
+
+    lines = ["<b>Список виконаних завдань:</b>"]
+    for i, task in enumerate(completed, start=1):
+        dt_completed = task["completed_date"].strftime("%d.%m %H:%M") if task["completed_date"] else "?"
+        lines.append(
+            f"{i}. [ID:{task['id']}] {task['type']} | Ціна: {task['price']}\n"
+            f"   Виконано: {dt_completed}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=get_main_menu())
+
+
+# -------------------
+# СУМА ЗА ОСТАННІ 30 ДНІВ
+# -------------------
+async def sum_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    init_user_data_if_needed(user_id)
+
+    now = datetime.datetime.now()
+    thirty_days_ago = now - datetime.timedelta(days=30)
+
+    completed = [t for t in tasks_data[user_id] if t["status"] == "completed"]
+    total = 0
+    for t in completed:
+        price = t["price"]
+        completed_dt = t["completed_date"]
+        if isinstance(price, int) and completed_dt and completed_dt >= thirty_days_ago:
+            total += price
+
+    await update.message.reply_text(
+        f"Сума за останні 30 днів: {total} грн",
+        reply_markup=get_main_menu()
+    )
+
+
+# -------------------
+# ЩОДЕННЕ НАГАДУВАННЯ
+# -------------------
+async def daily_reminder(context: CallbackContext):
+    """
+    Викликається о 6:00 (налаштовується в job_queue.run_daily).
+    Надсилає список завдань, що припадають на поточну дату.
+    """
+    now = datetime.datetime.now()
+    today = now.date()
+
+    for user_id, user_tasks in tasks_data.items():
+        # Знайти невиконані завдання, в яких date == сьогодні
+        tasks_today = [
+            t for t in user_tasks
+            if t["status"] == "uncompleted"
+            and isinstance(t["datetime"], datetime.datetime)
+            and t["datetime"].date() == today
+        ]
+
+        if tasks_today:
+            # Сортуємо за часом
+            tasks_today.sort(key=lambda x: x["datetime"])
+            lines = ["<b>Сьогоднішні завдання:</b>"]
+            for task in tasks_today:
+                time_str = task["datetime"].strftime("%H:%M")
+                lines.append(
+                    f"• [ID:{task['id']}] {task['type']} о {time_str}\n"
+                    f"  (Тел: {task['phone']}, Ціна: {task['price']})"
+                )
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="\n".join(lines),
+                parse_mode="HTML"
+            )
+        # Якщо немає завдань – нічого не надсилаємо
+
+
+# -------------------
+# FALLBACK
+# -------------------
+async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    if text == "на початок":
+        await start_command(update, context)
+    else:
+        await update.message.reply_text(
+            "Вибачте, я не зрозумів. Спробуйте ще раз або натисніть 'На початок'."
+        )
+
+
+# -------------------
+# MAIN
+# -------------------
+def main():
+    BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+    persistence = PicklePersistence(filepath="bot_data.pkl")
+
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+
+    # Щоденне нагадування о 6:00
+    app.job_queue.run_daily(
+        daily_reminder,
+        time=datetime.time(hour=6, minute=0, second=0)
+    )
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Додати завдання$"), add_task_start)],
+        states={
+            CHOOSING_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_type)],
+            CHOOSING_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_date)],
+            CHOOSING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_time)],
+            INPUT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_city)],
+            INPUT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_phone)],
+            INPUT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_price)],
+        },
+        fallbacks=[
+            MessageHandler(filters.Regex("^На початок$"), start_command)
+        ]
+    )
+
+    # /start
+    app.add_handler(CommandHandler("start", start_command))
+    # Додати завдання (Conversation)
+    app.add_handler(conv_handler)
+
+    # Перегляд завдань
+    app.add_handler(MessageHandler(filters.Regex("^Перегляд завдань$"), view_tasks))
+
+    # Видалення
+    app.add_handler(MessageHandler(filters.Regex("^Видалити завдання$"), delete_task_request))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(Перегляд завдань|Виконані завдання|Сума за останній місяць)$"),
+        delete_task_confirm
+    ), 1)
+
+    # Позначити виконаним
+    app.add_handler(MessageHandler(filters.Regex("^Позначити завдання виконаним$"), complete_task_request))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(Перегляд завдань|Виконані завдання|Сума за останній місяць)$"),
+        complete_task_confirm
+    ), 2)
+
+    # Виконані завдання
+    app.add_handler(MessageHandler(filters.Regex("^Виконані завдання$"), view_completed_tasks))
+
+    # Сума за останній місяць
+    app.add_handler(MessageHandler(filters.Regex("^Сума за останній місяць$"), sum_last_month))
+
+    # На початок
+    app.add_handler(MessageHandler(filters.Regex("^На початок$"), start_command))
+
+    # Fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
