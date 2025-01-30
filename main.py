@@ -1,13 +1,11 @@
-# main.py
-
 import os
 import logging
 import datetime
 import re
 import asyncio
 
-# Якщо Railway/хостинг має проблеми з асинхронним циклом (наприклад, Replit),
-# можна підключити nest_asyncio:
+# Якщо хостинг (наприклад, Railway) має проблеми з уже запущеним "event loop",
+# можна підключити nest_asyncio, щоб уникнути винятків типу "loop is already running".
 try:
     import nest_asyncio
     nest_asyncio.apply()
@@ -124,7 +122,6 @@ class TaskManager:
             cursor = await db.execute('SELECT DISTINCT user_id FROM tasks')
             return await cursor.fetchall()
 
-# Ініціалізуємо TaskManager
 task_manager = TaskManager()
 
 # =========================
@@ -330,18 +327,14 @@ async def main():
 
     # 3. Додаємо хендлери команд і повідомлень
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.Text(["Перегляд завдань"]), 
-        view_tasks
-    ))
-    app.add_handler(MessageHandler(
-        filters.Text(["Виконані завдання"]), 
-        view_completed
-    ))
+    app.add_handler(MessageHandler(filters.Text(["Перегляд завдань"]), view_tasks))
+    app.add_handler(MessageHandler(filters.Text(["Виконані завдання"]), view_completed))
+    # Обробка будь-якого іншого тексту (крім команд) — на handle_free_text
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Text(["Додати завдання"]),
         handle_free_text
     ))
+    # CallbackQueryHandler для кнопок видалення/виконання
     app.add_handler(CallbackQueryHandler(button_handler))
 
     # 4. Додаємо щоденний джоб (нагадування о 9:00)
@@ -355,5 +348,4 @@ async def main():
 # =========================
 
 if __name__ == "__main__":
-    # Запускаємо головну корутину через asyncio
     asyncio.run(main())
