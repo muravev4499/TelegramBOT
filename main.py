@@ -2,7 +2,15 @@ import os
 import logging
 import datetime
 import re
-import asyncio  # ← додаємо для роботи з asyncio
+import asyncio
+
+# Підключаємо nest_asyncio: він "пропатчить" існуючий event loop (якщо є)
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
+
 import aiosqlite
 import dateparser
 from telegram import (
@@ -21,6 +29,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # =========================
 # НАЛАШТУВАННЯ
 # =========================
@@ -34,15 +43,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-(
-    CHOOSING_TYPE,
-    CHOOSING_DATE,
-    CHOOSING_TIME,
-    INPUT_CITY,
-    INPUT_PHONE,
-    INPUT_PRICE,
-) = range(6)
 
 MAIN_MENU_KEYBOARD = [
     ["Додати завдання"],
@@ -149,12 +149,11 @@ def extract_data(text: str) -> dict:
     result = {}
     text_lower = text.lower()
 
-    # Тип завдання (наприклад: "винос", "топозйомка", "приватизація")
+    # Тип завдання
     type_match = re.search(patterns["type"], text_lower)
     if type_match:
         result["type"] = type_match.group(1).capitalize()
     else:
-        # Якщо точної згадки немає, шукаємо певні ключові слова
         keywords = {
             "винос": ["вивіз", "сміття", "меблі", "побутова техніка", "вантаж"],
             "топозйомка": ["топосъемка", "геодезія", "план місцевості", "розмітка", "кадастр"],
@@ -167,7 +166,7 @@ def extract_data(text: str) -> dict:
         else:
             result["type"] = "Інше"
 
-    # Дата й час (через dateparser.parse)
+    # Дата та час
     parsed_datetime = dateparser.parse(
         text, 
         languages=['uk'], 
@@ -176,7 +175,6 @@ def extract_data(text: str) -> dict:
     if parsed_datetime:
         result["datetime"] = parsed_datetime
     else:
-        # Якщо не розпізналось, беремо поточний момент
         result["datetime"] = datetime.datetime.now()
 
     # Телефон
@@ -273,7 +271,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await task_manager.complete_task(task_id)
         await query.answer(f"Завдання {task_id} виконано!")
 
-    # Після обробки видаляємо повідомлення зі списком завдань
     await query.message.delete()
 
 async def view_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,18 +304,16 @@ async def daily_reminder(context: CallbackContext):
 
 async def main():
     """
-    Головна асинхронна функція:
-    - ініціалізує базу даних,
-    - створює Application (бот),
-    - додає хендлери,
-    - запускає run_polling() в асинхронному режимі.
+    Головна асинхронна функція, яка:
+    - Ініціалізує базу даних (await task_manager.init_db()) 
+    - Створює Application (Telegram Bot)
+    - Додає усі хендлери
+    - Запускає run_polling()
     """
-    # Ініціалізуємо БД перед запуском бота
     await task_manager.init_db()
 
     app = Application.builder().token(TOKEN).build()
 
-    # Додаємо хендлери
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Text(["Додати завдання"]),
         handle_free_text
@@ -328,11 +323,27 @@ async def main():
     app.add_handler(MessageHandler(filters.Text(["Виконані завдання"]), view_completed))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Плануємо щоденне нагадування
+    # Запускаємо щоденний джоб
     app.job_queue.run_daily(daily_reminder, time=datetime.time(hour=9))
 
-    # Запускаємо асинхронне опитування Telegram
+    # Запуск бота
     await app.run_polling()
 
+# =========================
+# ЗАПУСК
+# =========================
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Якщо середовище вже тримає цикл подій (наприклад, Railway/Replit/Jupyter) – nest_asyncio це виправить.
+    # Інакше запускаємо новий цикл через run_until_complete.
+    loop = asyncio.get_event_loop()
+
+    if not loop.is_running():
+        # У більшості звичайних випадків (локально/на сервері) цикл іще не запущено
+        loop.run_until_complete(main())
+    else:
+        # Якщо цикл уже працює, запускаємо корутину main() у ньому
+        loop.create_task(main())
+        # За потреби (якщо це звичайний скрипт) чекаємо завершення
+        # але часто у хмарних середовищах можна обійтися без loop.run_forever()
+        loop.run_forever()
