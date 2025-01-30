@@ -1,4 +1,4 @@
-nest_asyncio
-python-telegram-bot[job-queue]==20.3
-aiosqlite
-dateparser
+python-telegram-bot==20.3
+dateparser==1.1.8
+aiosqlite==0.18.2
+nest_asyncio==1.5.6
