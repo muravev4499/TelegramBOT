@@ -2,6 +2,7 @@ import os
 import logging
 import datetime
 import re
+import asyncio  # ← додаємо для роботи з asyncio
 import aiosqlite
 import dateparser
 from telegram import (
@@ -14,7 +15,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ConversationHandler,
     CallbackQueryHandler,
     ContextTypes,
     CallbackContext,
@@ -78,8 +78,10 @@ class TaskManager:
 
     async def save_task(self, user_id: int, task: dict):
         async with aiosqlite.connect(self.db_name) as db:
-            await db.execute('''INSERT INTO tasks 
-                VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+            await db.execute('''
+                INSERT INTO tasks 
+                VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
                 user_id,
                 task["type"],
                 task["datetime"].isoformat(),
@@ -94,7 +96,9 @@ class TaskManager:
 
     async def get_tasks(self, user_id: int, status: str = None):
         async with aiosqlite.connect(self.db_name) as db:
-            query = 'SELECT * FROM tasks WHERE user_id = ?' + (f' AND status = "{status}"' if status else '')
+            query = 'SELECT * FROM tasks WHERE user_id = ?'
+            if status:
+                query += f' AND status = "{status}"'
             cursor = await db.execute(query, (user_id,))
             return await cursor.fetchall()
 
@@ -105,9 +109,11 @@ class TaskManager:
 
     async def complete_task(self, task_id: int):
         async with aiosqlite.connect(self.db_name) as db:
-            await db.execute('''UPDATE tasks 
+            await db.execute('''
+                UPDATE tasks 
                 SET status = ?, completed_date = ?
-                WHERE id = ?''', (
+                WHERE id = ?
+            ''', (
                 "completed",
                 datetime.datetime.now().isoformat(),
                 task_id
@@ -118,6 +124,7 @@ class TaskManager:
         async with aiosqlite.connect(self.db_name) as db:
             cursor = await db.execute('SELECT DISTINCT user_id FROM tasks')
             return await cursor.fetchall()
+
 
 task_manager = TaskManager()
 
@@ -142,11 +149,12 @@ def extract_data(text: str) -> dict:
     result = {}
     text_lower = text.lower()
 
-    # Тип завдання
+    # Тип завдання (наприклад: "винос", "топозйомка", "приватизація")
     type_match = re.search(patterns["type"], text_lower)
     if type_match:
         result["type"] = type_match.group(1).capitalize()
     else:
+        # Якщо точної згадки немає, шукаємо певні ключові слова
         keywords = {
             "винос": ["вивіз", "сміття", "меблі", "побутова техніка", "вантаж"],
             "топозйомка": ["топосъемка", "геодезія", "план місцевості", "розмітка", "кадастр"],
@@ -159,7 +167,7 @@ def extract_data(text: str) -> dict:
         else:
             result["type"] = "Інше"
 
-    # Дата та час
+    # Дата й час (через dateparser.parse)
     parsed_datetime = dateparser.parse(
         text, 
         languages=['uk'], 
@@ -168,6 +176,7 @@ def extract_data(text: str) -> dict:
     if parsed_datetime:
         result["datetime"] = parsed_datetime
     else:
+        # Якщо не розпізналось, беремо поточний момент
         result["datetime"] = datetime.datetime.now()
 
     # Телефон
@@ -264,6 +273,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await task_manager.complete_task(task_id)
         await query.answer(f"Завдання {task_id} виконано!")
 
+    # Після обробки видаляємо повідомлення зі списком завдань
     await query.message.delete()
 
 async def view_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,24 +305,34 @@ async def daily_reminder(context: CallbackContext):
 # НАЛАШТУВАННЯ ДОДАТКУ
 # =========================
 
-def main():
+async def main():
+    """
+    Головна асинхронна функція:
+    - ініціалізує базу даних,
+    - створює Application (бот),
+    - додає хендлери,
+    - запускає run_polling() в асинхронному режимі.
+    """
+    # Ініціалізуємо БД перед запуском бота
+    await task_manager.init_db()
+
     app = Application.builder().token(TOKEN).build()
 
+    # Додаємо хендлери
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Text(["Додати завдання"]),
         handle_free_text
     ))
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Text(["Перегляд завдань"]), view_tasks))
     app.add_handler(MessageHandler(filters.Text(["Виконані завдання"]), view_completed))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # Плануємо щоденне нагадування
     app.job_queue.run_daily(daily_reminder, time=datetime.time(hour=9))
 
-    app.run_polling()
+    # Запускаємо асинхронне опитування Telegram
+    await app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(task_manager.init_db())
-    main()
+    asyncio.run(main())
