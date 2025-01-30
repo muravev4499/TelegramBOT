@@ -4,7 +4,7 @@ import datetime
 import re
 import asyncio
 
-# Підключаємо nest_asyncio: він "пропатчить" існуючий event loop (якщо є)
+# 1) Підключаємо nest_asyncio, щоб «пропатчити» цикл подій і уникнути помилки
 try:
     import nest_asyncio
     nest_asyncio.apply()
@@ -27,8 +27,9 @@ from telegram.ext import (
     ContextTypes,
     CallbackContext,
     filters,
+    # Додамо idle для ручного керування ботом
+    idle
 )
-
 
 # =========================
 # НАЛАШТУВАННЯ
@@ -166,7 +167,7 @@ def extract_data(text: str) -> dict:
         else:
             result["type"] = "Інше"
 
-    # Дата та час
+    # Дата/час
     parsed_datetime = dateparser.parse(
         text, 
         languages=['uk'], 
@@ -182,7 +183,7 @@ def extract_data(text: str) -> dict:
     if phone_match:
         result["phone"] = phone_match.group(0).replace(" ", "")
 
-    # Вартість
+    # Ціна
     price_match = re.search(patterns["price"], text, re.IGNORECASE)
     if price_match:
         result["price"] = float(price_match.group(1).replace(",", "."))
@@ -200,7 +201,7 @@ def extract_data(text: str) -> dict:
     return result
 
 # =========================
-# ОСНОВНА ЛОГІКА
+# ОСНОВНА ЛОГІКА БОТА
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,6 +288,7 @@ async def view_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(f"📋 Виконані завдання:\n{text}")
 
+# Джоб для щоденних нагадувань
 async def daily_reminder(context: CallbackContext):
     users = await task_manager.get_all_users()
     for user in users:
@@ -299,21 +301,17 @@ async def daily_reminder(context: CallbackContext):
             )
 
 # =========================
-# НАЛАШТУВАННЯ ДОДАТКУ
+# ГОЛОВНА АСИНХРОННА ФУНКЦІЯ
 # =========================
 
 async def main():
-    """
-    Головна асинхронна функція, яка:
-    - Ініціалізує базу даних (await task_manager.init_db()) 
-    - Створює Application (Telegram Bot)
-    - Додає усі хендлери
-    - Запускає run_polling()
-    """
+    # 1) Ініціалізуємо базу даних
     await task_manager.init_db()
 
+    # 2) Створюємо Application
     app = Application.builder().token(TOKEN).build()
 
+    # 3) Додаємо хендлери
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Text(["Додати завдання"]),
         handle_free_text
@@ -323,27 +321,36 @@ async def main():
     app.add_handler(MessageHandler(filters.Text(["Виконані завдання"]), view_completed))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Запускаємо щоденний джоб
+    # 4) Додаємо щоденний джоб
     app.job_queue.run_daily(daily_reminder, time=datetime.time(hour=9))
 
-    # Запуск бота
-    await app.run_polling()
+    # 5) Ініціалізація та запуск вручну,
+    #    щоб не було спроб закрити event loop зсередини app.run_polling()
+    await app.initialize()
+    await app.start()
+
+    # 6) Чекаємо на «Ctrl+C» або завершення сервісу
+    await idle()  # import з telegram.ext
+
+    # 7) При зупинці зупиняємо і завершуємо коректно
+    await app.stop()
+    await app.shutdown()
+
 
 # =========================
-# ЗАПУСК
+# ТОЧКА ВХОДУ
 # =========================
 
 if __name__ == "__main__":
-    # Якщо середовище вже тримає цикл подій (наприклад, Railway/Replit/Jupyter) – nest_asyncio це виправить.
-    # Інакше запускаємо новий цикл через run_until_complete.
+    # Одержуємо існуючий цикл (Railway/Replit/Jupyter можуть уже мати його запущеним)
     loop = asyncio.get_event_loop()
 
     if not loop.is_running():
-        # У більшості звичайних випадків (локально/на сервері) цикл іще не запущено
+        # Якщо цикл НЕ запущений – стандартний випадок
         loop.run_until_complete(main())
     else:
-        # Якщо цикл уже працює, запускаємо корутину main() у ньому
+        # Якщо цикл уже запущений (наприклад, Jupyter/Replit),
+        # просто створюємо завдання і лишаємо "на фоні".
         loop.create_task(main())
-        # За потреби (якщо це звичайний скрипт) чекаємо завершення
-        # але часто у хмарних середовищах можна обійтися без loop.run_forever()
-        loop.run_forever()
+        # За потреби розкоментуйте, якщо хочете тримати цикл "вічно":
+        # loop.run_forever()
