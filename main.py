@@ -1,10 +1,13 @@
+# main.py
+
 import os
 import logging
 import datetime
 import re
 import asyncio
 
-# 1) Підключаємо nest_asyncio, щоб «пропатчити» цикл подій і уникнути помилки
+# Якщо Railway/хостинг має проблеми з асинхронним циклом (наприклад, Replit),
+# можна підключити nest_asyncio:
 try:
     import nest_asyncio
     nest_asyncio.apply()
@@ -27,23 +30,18 @@ from telegram.ext import (
     ContextTypes,
     CallbackContext,
     filters,
-    # Додамо idle для ручного керування ботом
-    idle
 )
-
-# =========================
-# НАЛАШТУВАННЯ
-# =========================
-
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise ValueError("❌ Змінна середовища TOKEN не встановлена!")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Зчитуємо токен з оточення (Railway → Settings → Variables)
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Змінна середовища TOKEN не встановлена!")
 
 MAIN_MENU_KEYBOARD = [
     ["Додати завдання"],
@@ -126,7 +124,7 @@ class TaskManager:
             cursor = await db.execute('SELECT DISTINCT user_id FROM tasks')
             return await cursor.fetchall()
 
-
+# Ініціалізуємо TaskManager
 task_manager = TaskManager()
 
 # =========================
@@ -134,9 +132,11 @@ task_manager = TaskManager()
 # =========================
 
 def get_main_menu():
+    """Створює клавіатуру з основним меню."""
     return ReplyKeyboardMarkup(MAIN_MENU_KEYBOARD, resize_keyboard=True)
 
 def extract_data(text: str) -> dict:
+    """Автоматичний парсер даних із вільного тексту."""
     patterns = {
         "date": r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|завтра|післязавтра)\b",
         "time": r"\b(\d{1,2}:\d{2})\b",
@@ -155,6 +155,7 @@ def extract_data(text: str) -> dict:
     if type_match:
         result["type"] = type_match.group(1).capitalize()
     else:
+        # Спробуємо підставити відомі ключові слова
         keywords = {
             "винос": ["вивіз", "сміття", "меблі", "побутова техніка", "вантаж"],
             "топозйомка": ["топосъемка", "геодезія", "план місцевості", "розмітка", "кадастр"],
@@ -167,7 +168,7 @@ def extract_data(text: str) -> dict:
         else:
             result["type"] = "Інше"
 
-    # Дата/час
+    # Дата/час (через dateparser)
     parsed_datetime = dateparser.parse(
         text, 
         languages=['uk'], 
@@ -205,9 +206,14 @@ def extract_data(text: str) -> dict:
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start – виводить головне меню."""
     await update.message.reply_text("🏠 Головне меню:", reply_markup=get_main_menu())
 
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обробка будь-якого вільного тексту (крім команд/спеціальних клавіатурних кнопок).
+    Автоматично розпізнає тип завдання, дату, час, телефон тощо.
+    """
     user_text = update.message.text
     parsed_data = extract_data(user_text)
     
@@ -228,9 +234,12 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "name": parsed_data.get("name", "Без імені"),
         }
         
+        # Зберігаємо в БД
         await task_manager.save_task(update.effective_user.id, task_data)
-        response = "✅ Завдання автоматично додано!\n" + "\n".join(
-            f"• {k}: {v}" for k, v in parsed_data.items() if v
+        
+        response = (
+            "✅ Завдання автоматично додано!\n" +
+            "\n".join(f"• {k}: {v}" for k, v in parsed_data.items() if v)
         )
         await update.message.reply_text(response)
         
@@ -239,6 +248,7 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Сталася помилка. Спробуйте ще раз.")
 
 async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показати усі активні (uncompleted) завдання для поточного користувача."""
     user_id = update.effective_user.id
     tasks = await task_manager.get_tasks(user_id, "uncompleted")
     
@@ -246,6 +256,7 @@ async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Немає активних завдань!")
         return
 
+    # Створюємо Inline-кнопки для кожного завдання
     keyboard = [
         [
             InlineKeyboardButton(f"❌ Видалити {task[0]}", callback_data=f"delete_{task[0]}"),
@@ -260,6 +271,7 @@ async def view_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробка натискань на inline-кнопки (видалити/виконати)."""
     query = update.callback_query
     data = query.data
 
@@ -272,9 +284,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await task_manager.complete_task(task_id)
         await query.answer(f"Завдання {task_id} виконано!")
 
+    # Видаляємо повідомлення з кнопками після дії
     await query.message.delete()
 
 async def view_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показати виконані завдання (status = 'completed')."""
     user_id = update.effective_user.id
     tasks = await task_manager.get_tasks(user_id, "completed")
     
@@ -288,8 +302,11 @@ async def view_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(f"📋 Виконані завдання:\n{text}")
 
-# Джоб для щоденних нагадувань
 async def daily_reminder(context: CallbackContext):
+    """
+    Щоденне нагадування: бот перевіряє, чи є в користувачів незавершені завдання,
+    і надсилає їм повідомлення.
+    """
     users = await task_manager.get_all_users()
     for user in users:
         user_id = user[0]
@@ -305,52 +322,38 @@ async def daily_reminder(context: CallbackContext):
 # =========================
 
 async def main():
-    # 1) Ініціалізуємо базу даних
+    # 1. Ініціалізуємо базу даних
     await task_manager.init_db()
 
-    # 2) Створюємо Application
+    # 2. Створюємо Application (Telegram Bot)
     app = Application.builder().token(TOKEN).build()
 
-    # 3) Додаємо хендлери
+    # 3. Додаємо хендлери команд і повідомлень
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.Text(["Перегляд завдань"]), 
+        view_tasks
+    ))
+    app.add_handler(MessageHandler(
+        filters.Text(["Виконані завдання"]), 
+        view_completed
+    ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Text(["Додати завдання"]),
         handle_free_text
     ))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Text(["Перегляд завдань"]), view_tasks))
-    app.add_handler(MessageHandler(filters.Text(["Виконані завдання"]), view_completed))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # 4) Додаємо щоденний джоб
+    # 4. Додаємо щоденний джоб (нагадування о 9:00)
     app.job_queue.run_daily(daily_reminder, time=datetime.time(hour=9))
 
-    # 5) Ініціалізація та запуск вручну,
-    #    щоб не було спроб закрити event loop зсередини app.run_polling()
-    await app.initialize()
-    await app.start()
-
-    # 6) Чекаємо на «Ctrl+C» або завершення сервісу
-    await idle()  # import з telegram.ext
-
-    # 7) При зупинці зупиняємо і завершуємо коректно
-    await app.stop()
-    await app.shutdown()
-
+    # 5. Запускаємо в режимі "polling"
+    await app.run_polling()
 
 # =========================
 # ТОЧКА ВХОДУ
 # =========================
 
 if __name__ == "__main__":
-    # Одержуємо існуючий цикл (Railway/Replit/Jupyter можуть уже мати його запущеним)
-    loop = asyncio.get_event_loop()
-
-    if not loop.is_running():
-        # Якщо цикл НЕ запущений – стандартний випадок
-        loop.run_until_complete(main())
-    else:
-        # Якщо цикл уже запущений (наприклад, Jupyter/Replit),
-        # просто створюємо завдання і лишаємо "на фоні".
-        loop.create_task(main())
-        # За потреби розкоментуйте, якщо хочете тримати цикл "вічно":
-        # loop.run_forever()
+    # Запускаємо головну корутину через asyncio
+    asyncio.run(main())
