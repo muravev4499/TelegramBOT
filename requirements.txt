@@ -1,3 +1,4 @@
+nest_asyncio
 python-telegram-bot[job-queue]==20.3
 aiosqlite
 dateparser
