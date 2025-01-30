@@ -1,2 +1,3 @@
 python-telegram-bot[job-queue]==20.3
-pip install python-telegram-bot aiosqlite dateparser
+aiosqlite
+dateparser
